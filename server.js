@@ -1,15 +1,15 @@
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
-const Replicate = require("replicate");
 const fs = require("fs");
-const path = require("path");
+const fetch = require("node-fetch");
+const FormData = require("form-data");
 require("dotenv").config();
 
 const app = express();
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("image/")) cb(null, true);
     else cb(new Error("Only image files allowed"));
@@ -19,17 +19,10 @@ const upload = multer({
 app.use(cors());
 app.use(express.json());
 
-// Ensure uploads dir exists
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
 
-const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN,
-});
-
-// Simple in-memory rate limiting (free tier: 5/day per IP)
 const rateLimitMap = new Map();
-function checkRateLimit(ip, isPro = false) {
-  if (isPro) return true; // Pro users unlimited
+function checkRateLimit(ip) {
   const today = new Date().toDateString();
   const key = `${ip}_${today}`;
   const count = rateLimitMap.get(key) || 0;
@@ -38,7 +31,6 @@ function checkRateLimit(ip, isPro = false) {
   return true;
 }
 
-// GET usage count
 app.get("/api/usage", (req, res) => {
   const ip = req.ip;
   const today = new Date().toDateString();
@@ -47,16 +39,12 @@ app.get("/api/usage", (req, res) => {
   res.json({ used: count, limit: 5 });
 });
 
-// POST upscale endpoint
 app.post("/api/upscale", upload.single("image"), async (req, res) => {
   const filePath = req.file?.path;
 
   try {
     const ip = req.ip;
-    const scale = parseInt(req.body.scale) || 2; // 2 or 4
-    const faceEnhance = req.body.faceEnhance === "true";
 
-    // Rate limit check
     if (!checkRateLimit(ip)) {
       return res.status(429).json({
         error: "Daily free limit reached (5 images). Upgrade to Pro for unlimited!",
@@ -68,47 +56,56 @@ app.post("/api/upscale", upload.single("image"), async (req, res) => {
       return res.status(400).json({ error: "No image uploaded" });
     }
 
-    // Convert image to base64 data URI
+    console.log("Upscaling image with Clipdrop...");
+
     const imageBuffer = fs.readFileSync(filePath);
-    const base64Image = `data:${req.file.mimetype};base64,${imageBuffer.toString("base64")}`;
 
-    console.log(`Upscaling image: scale=${scale}x, faceEnhance=${faceEnhance}`);
+    const form = new FormData();
+    form.append("image_file", imageBuffer, {
+      filename: req.file.originalname || "image.jpg",
+      contentType: req.file.mimetype,
+    });
 
-    // Call Replicate - Real-ESRGAN model
-    const output = await replicate.run(
-      "nightmareai/real-esrgan:42fed1c4974146d4d2414e2be2c5277c7fcf05fcc3a73abf41610695738c1d7b",
-      {
-        input: {
-          image: base64Image,
-          scale: scale,
-          face_enhance: faceEnhance,
-        },
-      }
-    );
+    const response = await fetch("https://clipdrop-api.co/image-upscaling/v1/upscale", {
+      method: "POST",
+      headers: {
+        "x-api-key": process.env.CLIPDROP_API_KEY,
+        ...form.getHeaders(),
+      },
+      body: form,
+    });
 
-    // output is a URL to the upscaled image
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Clipdrop error:", errText);
+      throw new Error(`Clipdrop error: ${response.status} — ${errText}`);
+    }
+
+    const imageArrayBuffer = await response.arrayBuffer();
+    const base64Output = Buffer.from(imageArrayBuffer).toString("base64");
+    const outputDataUrl = `data:image/png;base64,${base64Output}`;
+
     res.json({
       success: true,
-      outputUrl: output,
-      scale: scale,
-      message: `Image upscaled ${scale}x successfully!`,
+      outputUrl: outputDataUrl,
+      scale: 2,
+      message: "Image upscaled successfully!",
     });
+
   } catch (err) {
     console.error("Upscale error:", err);
     res.status(500).json({
       error: err.message || "Upscaling failed. Please try again.",
     });
   } finally {
-    // Clean up uploaded file
     if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
   }
 });
 
-// Health check
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", service: "UpscaleAI Backend" });
+  res.json({ status: "ok", service: "UpscaleAI Backend — Clipdrop" });
 });
 
 const PORT = process.env.PORT || 3001;
